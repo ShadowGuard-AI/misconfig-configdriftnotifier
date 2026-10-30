@@ -1,3 +1,5 @@
+![Banner](banner.png)
+
 # misconfig-ConfigDriftNotifier
 Monitors configuration files for changes and sends alerts (e.g., email, Slack) upon detection of drift. Utilizes `watchdog` library for file system monitoring. - Focused on Check for misconfigurations in configuration files or infrastructure definitions
 
