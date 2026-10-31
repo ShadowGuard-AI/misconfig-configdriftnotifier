@@ -64,6 +64,9 @@ def validate_config(config):
     if 'monitored_files' not in config or not isinstance(config['monitored_files'], list):
         raise ValueError("Configuration must include 'monitored_files' as a list.")
 
+    if not config['monitored_files']:
+        raise ValueError("Configuration must name at least one file in 'monitored_files'; an empty list watches nothing.")
+
     if 'notification' not in config or not isinstance(config['notification'], dict):
         raise ValueError("Configuration must include 'notification' settings.")
 
@@ -97,7 +100,11 @@ def send_email_alert(subject, body, config):
     smtp_server = email_config['smtp_server']
     smtp_port = email_config['smtp_port']
     smtp_user = email_config.get('smtp_user')
-    smtp_password = email_config.get('smtp_password')
+    # The password comes from an environment variable, never from the
+    # config file. Name the variable with smtp_password_env, or use the
+    # default name SMTP_PASSWORD.
+    password_env = email_config.get('smtp_password_env') or 'SMTP_PASSWORD'
+    smtp_password = os.environ.get(password_env)
 
     msg = MIMEText(body)
     msg['Subject'] = subject
@@ -106,9 +113,15 @@ def send_email_alert(subject, body, config):
 
     try:
         with smtplib.SMTP(smtp_server, smtp_port) as server:
-            if smtp_user and smtp_password:
+            server.ehlo()
+            if server.has_extn('STARTTLS'):
+                # Use transport encryption whenever the server offers
+                # it, whether or not a login follows. If it cannot be
+                # established, the alert is not sent in clear.
                 server.starttls()
-                server.login(smtp_user, smtp_password)  # Consider using environment variables for credentials.
+                server.ehlo()
+            if smtp_user and smtp_password:
+                server.login(smtp_user, smtp_password)
             server.sendmail(sender, recipients, msg.as_string())
         logging.info("Email alert sent successfully.")
     except Exception as e:
@@ -137,6 +150,8 @@ def lint_file(filepath, filetype):
 
     Returns:
         tuple: (True, None) if linting is successful, (False, error_message) if there's an error.
+        A missing linter returns (None, error_message): that is a tool
+        problem on this machine, not a verdict on the file.
     """
     try:
         if filetype == "yaml":
@@ -154,7 +169,7 @@ def lint_file(filepath, filetype):
         else:
             return False, f"Unsupported file type: {filetype}"
     except FileNotFoundError as e:
-        return False, f"Linter not found. Ensure yamllint/jsonlint is installed: {e}"
+        return None, f"Linter not found. Ensure yamllint/jsonlint is installed: {e}"
     except subprocess.CalledProcessError as e:
         return False, f"Linter process error: {e.stderr}"
     except Exception as e:
@@ -170,6 +185,9 @@ class ConfigChangeHandler(FileSystemEventHandler):
     def __init__(self, config):
         super().__init__()
         self.config = config
+        # Resolve monitored paths once, so a relative entry in the
+        # config matches the absolute paths watchdog reports.
+        self.monitored_files = [os.path.realpath(os.path.abspath(p)) for p in config.get('monitored_files', [])]
 
     def on_modified(self, event):
         """
@@ -182,11 +200,11 @@ class ConfigChangeHandler(FileSystemEventHandler):
             return  # Ignore directory changes
 
         filepath = event.src_path
+        resolved = os.path.realpath(os.path.abspath(filepath))
 
-        if filepath in self.config['monitored_files']:
+        if resolved in self.monitored_files:
             logging.info(f"Configuration file changed: {filepath}")
 
-            # Determine file type based on extension (improve for content-based detection if needed)
             if filepath.endswith(('.yaml', '.yml')):
                 filetype = "yaml"
             elif filepath.endswith('.json'):
@@ -194,18 +212,28 @@ class ConfigChangeHandler(FileSystemEventHandler):
             else:
                 filetype = "unknown"
 
-            # Lint the file
-            if filetype in ("yaml", "json"):
-                lint_success, lint_message = lint_file(filepath, filetype)
+            if filetype not in ("yaml", "json"):
+                # No linter applies here. Send a plain modified alert
+                # instead of failing on an unassigned lint result.
+                self.send_alert(f"Configuration file {filepath} has been modified.")
+                return
 
-                if not lint_success:
-                    error_message = f"Configuration file {filepath} is invalid: {lint_message}"
-                    logging.error(error_message)
-                    self.send_alert(error_message)
-                    return  # Stop processing further if linting fails
+            lint_success, lint_message = lint_file(filepath, filetype)
+
+            if lint_success is None:
+                # The linter itself is missing on this machine. That
+                # says nothing about the file, so log it locally and
+                # do not report the file as invalid to recipients.
+                logging.error(f"Linting skipped for {filepath}: {lint_message}")
+                return
+
+            if not lint_success:
+                error_message = f"Configuration file {filepath} is invalid: {lint_message}"
+                logging.error(error_message)
+                self.send_alert(error_message)
+                return
 
             try:
-                # TODO: Add more sophisticated diffing logic here.  For now, just alert.
                 message = f"Configuration file {filepath} has been modified. Linting: {lint_success}.  Message: {lint_message if lint_message else 'Linting Passed'}"
                 self.send_alert(message)
 
@@ -260,18 +288,10 @@ def main():
         exit(1)
 
 
-    # Sanitize file paths (example: removing ../../ tricks - simplistic)
-    monitored_files = config['monitored_files']
-    sanitized_files = []
-    for file_path in monitored_files:
-        abs_path = os.path.abspath(file_path) # Get the real absolute path
-        if not abs_path.startswith(os.getcwd()):
-             logging.warning(f"Path {file_path} resolves to outside the current directory.  Sanitizing to be inside.")
-             sanitized_files.append(os.path.basename(file_path)) #Just use file name to be secure
-        else:
-            sanitized_files.append(file_path)
-
-    config['monitored_files'] = sanitized_files # Update config
+    # Resolve each monitored path to its absolute form and watch the
+    # file the operator named, wherever it lives. Paths are never
+    # rewritten to a different file inside the working directory.
+    config['monitored_files'] = [os.path.realpath(os.path.abspath(p)) for p in config['monitored_files']]
 
     event_handler = ConfigChangeHandler(config)
     observer = Observer()
@@ -321,7 +341,8 @@ notification:
     smtp_server: "smtp.example.com"
     smtp_port: 587
     smtp_user: "smtp_username" #Optional
-    smtp_password: "smtp_password" #Optional - IMPORTANT:  Consider using environment variables!
+    # No password field here. Set the SMTP_PASSWORD environment
+    # variable, or name a different variable with smtp_password_env.
 
 4.  Slack Placeholder example config
 notification:
