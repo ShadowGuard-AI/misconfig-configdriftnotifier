@@ -73,6 +73,9 @@ def validate_config(config):
     if config['notification'].get('type') not in ('email', 'slack', None):
         raise ValueError("Notification type must be 'email' or 'slack', or None.")
 
+    # Slack gets no equivalent block here. A slack config with no
+    # destination at all passes validation, and the gap only shows
+    # up later, at the first real change, in the placeholder sender.
     if config['notification'].get('type') == 'email':
         email_config = config['notification'].get('email')
         if not email_config:
@@ -118,8 +121,19 @@ def send_email_alert(subject, body, config):
                 # Use transport encryption whenever the server offers
                 # it, whether or not a login follows. If it cannot be
                 # established, the alert is not sent in clear.
+                # Encryption here is opportunistic. A server that does not
+                # offer STARTTLS gets the session anyway, in clear, login
+                # included. Only a server that offers it and then fails to
+                # establish it stops the send, through the outer handler.
                 server.starttls()
                 server.ehlo()
+            # Both halves have to be present or there is no login at all.
+            # A user name with a missing password variable therefore sends
+            # unauthenticated without any warning, and if the server then
+            # refuses the mail, that refusal is caught below, logged, and
+            # never reaches the caller, which carries on as if the alert
+            # went out. The same is true of every send failure in this
+            # function: alerting is fire and forget in my design.
             if smtp_user and smtp_password:
                 server.login(smtp_user, smtp_password)
             server.sendmail(sender, recipients, msg.as_string())
@@ -159,6 +173,11 @@ def lint_file(filepath, filetype):
             if result.returncode == 0:
                 return True, None
             else:
+                # This branch is dead code: check=True in the run call above
+                # turns a nonzero exit into the CalledProcessError handled
+                # below, so control never reaches a returncode test. I leave
+                # the shape as written and note it, because the json branch
+                # below has the same structure.
                 return False, f"yamllint failed with error: {result.stderr}"
         elif filetype == "json":
             result = subprocess.run(['jsonlint', filepath], capture_output=True, text=True, check=True)
@@ -189,6 +208,11 @@ class ConfigChangeHandler(FileSystemEventHandler):
         # config matches the absolute paths watchdog reports.
         self.monitored_files = [os.path.realpath(os.path.abspath(p)) for p in config.get('monitored_files', [])]
 
+    # Only modification events are handled. Editors that save by
+    # writing a new file and renaming it over the old one, which
+    # is the common atomic save pattern, produce move and create
+    # events instead, and I stay silent for exactly the saves a
+    # careful editor makes. Nothing here watches for them.
     def on_modified(self, event):
         """
         Called when a file or directory is modified.
@@ -281,6 +305,10 @@ def main():
     args = parser.parse_args()
 
     try:
+        # The config is read once, here, and never reloaded. Editing
+        # the notifier's own config while it runs changes nothing,
+        # including the monitored list, until the process restarts,
+        # even when the config file is itself one of the files watched.
         config = load_config(args.config)
         validate_config(config) # Validate after loading.
     except Exception as e:
@@ -302,6 +330,11 @@ def main():
         directories_to_watch.add(os.path.dirname(os.path.abspath(file_path)))
 
     for directory in directories_to_watch:
+       # Watching is per directory, not per file, and the handler
+       # filters events against the monitored list. A busy shared
+       # directory therefore wakes the handler for every change in
+       # it, and a monitored file in a subdirectory of a watched
+       # directory is not covered, because the watch is not recursive.
        observer.schedule(event_handler, directory, recursive=False)
 
     observer.start()
